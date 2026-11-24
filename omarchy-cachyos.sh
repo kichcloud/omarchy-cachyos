@@ -58,7 +58,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.0"
+VERSION="2.1"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -613,11 +613,19 @@ install_repos() {
   tar -xf "$tmp/repo.tar.xz" -C "$tmp"
   [[ -x $tmp/cachyos-repo/cachyos-repo.sh ]] || { rm -rf "$tmp"; die "в архиве нет cachyos-repo.sh"; }
 
-  # Установщик в конце делает `pacman -Syu`. alpm-хук Omarchy ругается на
-  # прямые системные апгрейды, но здесь родитель — скрипт, так что хук не
-  # срабатывает; всё же выставляем разрешение явно, а штатный
-  # `omarchy update` с миграциями выполняется сразу следом.
-  if ! ( cd "$tmp/cachyos-repo" && as_root env OMARCHY_ALLOW_DIRECT_PACMAN=1 ./cachyos-repo.sh --install ); then
+  # Установщик в конце делает `pacman -U` (keyring, mirrorlists, свой pacman)
+  # и затем `pacman -Syu`. На свежей Omarchy CachyOS-pacman собран против
+  # libcrypto.so=4, которого в системе ещё нет и неоткуда взять до
+  # синхронизации репозиториев — pacman спрашивает «skip the above package?»
+  # и ждёт ответа. Отвечаем y: сам pacman пропускается, keyring/mirrorlists
+  # ставятся, а после добавления репозиториев зависимость разрешается в
+  # обычном `pacman -Syu`. Ответы подаём заранее, чтобы не было вопросов.
+  # alpm-хук Omarchy против прямых апгрейдов здесь не срабатывает
+  # (родитель — скрипт), но разрешение выставляем явно; штатный
+  # `omarchy update` с миграциями идёт сразу следом.
+  if ! ( cd "$tmp/cachyos-repo" &&
+         { for _ in {1..50}; do echo y; done; } |
+           as_root env OMARCHY_ALLOW_DIRECT_PACMAN=1 ./cachyos-repo.sh --install ); then
     rm -rf "$tmp"
     die "установщик CachyOS завершился с ошибкой"
   fi
