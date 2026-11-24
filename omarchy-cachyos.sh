@@ -59,7 +59,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.3"
+VERSION="2.4"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -183,9 +183,16 @@ stop_sudo_keepalive() {
 start_progress() {
   (( DRY )) && return 0
   (
+    # set -E наследует ERR-ловушку в подоболочки, а pacman во время загрузки
+    # создаёт каталоги 700 root: du получает permission denied и «падает».
+    # Здесь ошибки не интересны — глушим ловушку и не даём du ронять цикл.
+    set +E
+    trap - ERR
     while sleep 30; do
+      local size
+      size=$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1 || true)
       printf '%s    … идёт загрузка/установка, кэш пакетов: %s%s\n' \
-        "$c_yel" "$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1)" "$c_reset"
+        "$c_yel" "${size:-?}" "$c_reset"
     done
   ) &
   PROGRESS_PID=$!
@@ -1090,6 +1097,12 @@ EOF
 
 apply_on_error() {
   local rc=$? line=${1:-?}
+  # set -E наследует ловушку в подоболочки и подстановки $(…). Оттуда молча
+  # выходим: иначе одна неудачная команда печатает «ошибку» из фонового
+  # индикатора прогресса, хотя основной скрипт продолжает работу.
+  if [[ ${BASHPID:-$$} != $$ ]]; then
+    exit "$rc"
+  fi
   trap - ERR
   warn "ошибка на строке $line (код $rc)"
   [[ -n $SNAP_ID ]] && warn "снапшот до изменений: #$SNAP_ID — Limine → Snapshots"
