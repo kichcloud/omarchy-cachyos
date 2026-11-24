@@ -65,7 +65,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.7"
+VERSION="2.8"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -782,7 +782,7 @@ do_mirrors() {
   as_root systemctl enable --now cachyos-rate-mirrors.timer 2>/dev/null || true
   msg "зеркала отранжированы, таймер включён"
   grep -m3 '^Server' /etc/pacman.d/cachyos-mirrorlist 2>/dev/null | sed 's/^/    /' || true
-  probe_slow_mirrors
+  probe_slow_mirrors || warn "проба зеркал не удалась — иду дальше без неё"
 }
 
 # --- карантин медленных зеркал ---------------------------------------------
@@ -855,7 +855,7 @@ probe_slow_mirrors() {
     u=${srv//\$arch/$arch}; u=${u//\$repo/$repo}
     u=${u%/}/$file
     read -r code speed < <(curl -o /dev/null -sS --max-time 8 -r 0-262143 \
-      -w '%{http_code} %{speed_download}' "$u" 2>/dev/null || echo '000 0')
+      -w '%{http_code} %{speed_download}\n' "$u" 2>/dev/null || printf '000 0\n') || true
     case ${code:-000} in
       2*) ;;
       *) continue ;;   # 404 — зеркало ещё не синхронизировалось, это не «медленно»
