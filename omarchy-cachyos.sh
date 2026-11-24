@@ -65,7 +65,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.6"
+VERSION="2.7"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -837,7 +837,8 @@ probe_slow_mirrors() {
   pkg=$(LC_ALL=C pacman -Sl cachyos-extra-znver4 2>/dev/null | awk 'NR==1{print $2}')
   [[ -n ${pkg:-} ]] || pkg=$(LC_ALL=C pacman -Sl cachyos 2>/dev/null | awk 'NR==1{print $2}')
   [[ -n ${pkg:-} ]] || return 0
-  url=$(LC_ALL=C pacman -Sp --print-format '%l' "$pkg" 2>/dev/null | head -1)
+  url=$(LC_ALL=C pacman -Sp --print-format '%l' "$pkg" 2>/dev/null |
+          grep -m1 '/cachyos/repo/' || true)
   [[ -n $url ]] || return 0
   rel=${url#*://}; rel=${rel#*/}
   file=${rel##*/}
