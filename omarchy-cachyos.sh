@@ -19,10 +19,11 @@
 #
 #  Почему именно так (грабли из теста):
 #    * `Architecture = auto` у установщика CachyOS схлопывается в x86_64 и
-#      v4/znver4-пакеты не ставятся — нужен явный список архитектур. Причём
-#      установщик в конце сам делает `pacman -Syu`, поэтому список ставится
-#      ДО него (в форме, которую его awk не перезапишет) — иначе первый
-#      апгрейд идёт базовым x86_64 и часть пакетов там и остаётся.
+#      v4/znver4-пакеты не ставятся — нужен явный список архитектур. Свой
+#      `pacman -Syu` установщика при этом пропускается: иначе он качал бы
+#      ~1.7 ГБ с ещё не отранжированного зеркала и базовым x86_64. Порядок
+#      теперь такой: установщик только добавляет репозитории → зеркала →
+#      полный апгрейд через `omarchy update`.
 #    * Omarchy ставит alpm-хук против прямого `pacman -Syu`. Установщику
 #      CachyOS он не мешает (у pacman другой родитель), но разрешение
 #      выставляется явно, а следом всё равно идёт штатный `omarchy update`.
@@ -58,7 +59,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.1"
+VERSION="2.2"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -72,6 +73,7 @@ NO_KERNEL=0
 NO_MIRRORS=0
 NO_SNAPSHOT=0
 SUDO_KEEPALIVE=""
+PROGRESS_PID=""
 
 PACMAN_CONF=${OMARCHY_CACHYOS_PACMAN_CONF:-/etc/pacman.conf}
 BACKUP_ROOT=${OMARCHY_CACHYOS_BACKUP_ROOT:-/var/backups/omarchy-cachyos}
@@ -171,6 +173,24 @@ start_sudo_keepalive() {
 stop_sudo_keepalive() {
   [[ -n ${SUDO_KEEPALIVE:-} ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null || true
   SUDO_KEEPALIVE=""
+}
+
+# Раз в 30 секунд показываем размер кэша пакетов: вывод pacman идёт через
+# tee (не терминал), поэтому прогресс-бар скрыт и кажется, что всё встало.
+start_progress() {
+  (( DRY )) && return 0
+  (
+    while sleep 30; do
+      printf '%s    … идёт загрузка/установка, кэш пакетов: %s%s\n' \
+        "$c_yel" "$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1)" "$c_reset"
+    done
+  ) &
+  PROGRESS_PID=$!
+}
+
+stop_progress() {
+  [[ -n ${PROGRESS_PID:-} ]] && kill "$PROGRESS_PID" 2>/dev/null || true
+  PROGRESS_PID=""
 }
 
 # ---------------------------------------------------------------------------
@@ -614,18 +634,43 @@ install_repos() {
   [[ -x $tmp/cachyos-repo/cachyos-repo.sh ]] || { rm -rf "$tmp"; die "в архиве нет cachyos-repo.sh"; }
 
   # Установщик в конце делает `pacman -U` (keyring, mirrorlists, свой pacman)
-  # и затем `pacman -Syu`. На свежей Omarchy CachyOS-pacman собран против
-  # libcrypto.so=4, которого в системе ещё нет и неоткуда взять до
-  # синхронизации репозиториев — pacman спрашивает «skip the above package?»
-  # и ждёт ответа. Отвечаем y: сам pacman пропускается, keyring/mirrorlists
-  # ставятся, а после добавления репозиториев зависимость разрешается в
-  # обычном `pacman -Syu`. Ответы подаём заранее, чтобы не было вопросов.
+  # и затем `pacman -Syu`. Два подводных камня:
+  #   * CachyOS-pacman собран против libcrypto.so=4, которого на свежей
+  #     Omarchy ещё нет — pacman спрашивает «skip the above package?».
+  #     Отвечаем y: keyring/mirrorlists ставятся, зависимость разрешится
+  #     позже в полном апгрейде.
+  #   * Его `pacman -Syu` качал бы ~1.7 ГБ с ещё не отранжированного
+  #     зеркала и молча (вывод идёт через tee, прогресс-бар скрыт).
+  #     Поэтому этот Syu мы перехватываем шимом и пропускаем: сначала
+  #     синхронизация, установка и запуск cachyos-rate-mirrors, а большой
+  #     апгрейд делает `omarchy update` уже с быстрых зеркал.
   # alpm-хук Omarchy против прямых апгрейдов здесь не срабатывает
-  # (родитель — скрипт), но разрешение выставляем явно; штатный
-  # `omarchy update` с миграциями идёт сразу следом.
+  # (родитель — скрипт), но разрешение выставляем явно.
+  local shim="$tmp/shim"
+  mkdir -p "$shim"
+  cat >"$shim/pacman" <<'SHIM'
+#!/bin/bash
+# Пропускаем только системный апгрейд установщика; всё остальное — настоящему pacman.
+sync=0 up=0
+for a in "$@"; do
+  case $a in
+    --sync) sync=1 ;;
+    --sysupgrade) up=1 ;;
+    --*) ;;
+    -*) [[ $a == *S* ]] && sync=1; [[ $a == *u* ]] && up=1 ;;
+  esac
+done
+if (( sync && up )); then
+  echo "[omarchy-cachyos] pacman -Syu установщика пропущен: апгрейд сделает omarchy update после ранжирования зеркал" >&2
+  exit 0
+fi
+exec /usr/bin/pacman "$@"
+SHIM
+  chmod +x "$shim/pacman"
+
   if ! ( cd "$tmp/cachyos-repo" &&
          { for _ in {1..50}; do echo y; done; } |
-           as_root env OMARCHY_ALLOW_DIRECT_PACMAN=1 ./cachyos-repo.sh --install ); then
+           as_root env PATH="$shim:$PATH" OMARCHY_ALLOW_DIRECT_PACMAN=1 ./cachyos-repo.sh --install ); then
     rm -rf "$tmp"
     die "установщик CachyOS завершился с ошибкой"
   fi
@@ -703,9 +748,13 @@ do_mirrors() {
     return
   fi
   if (( DRY )); then
-    info "[dry-run] pacman -S cachyos-rate-mirrors; cachyos-rate-mirrors"
+    info "[dry-run] pacman -Sy; pacman -S cachyos-rate-mirrors; cachyos-rate-mirrors"
     return
   fi
+  # После установщика базы ещё не синхронизированы под новый Architecture;
+  # без -Sy пакет cachyos-rate-mirrors не найдётся.
+  as_root pacman -Sy --noconfirm ||
+    { warn "не удалось синхронизировать базы — зеркала не ранжирую"; return; }
   as_root pacman -S --needed --noconfirm cachyos-rate-mirrors ||
     { warn "не удалось поставить cachyos-rate-mirrors"; return; }
 
@@ -725,7 +774,9 @@ do_update() {
     return
   fi
   msg "обновляю систему штатным omarchy update (снапшот + миграции)"
-  omarchy update -y || die "omarchy update завершился с ошибкой — см. вывод выше; скрипт можно запустить повторно"
+  start_progress
+  omarchy update -y || { stop_progress; die "omarchy update завершился с ошибкой — см. вывод выше; скрипт можно запустить повторно"; }
+  stop_progress
 }
 
 check_pins_after_update() {
@@ -1059,7 +1110,7 @@ cmd_apply() {
       die "нет доступа к $CACHYOS_REPO_URL — проверьте интернет"
     sudo -v || die "без sudo переход невозможен"
     start_sudo_keepalive
-    trap 'stop_sudo_keepalive' EXIT
+    trap 'stop_sudo_keepalive; stop_progress' EXIT
   fi
 
   countdown
