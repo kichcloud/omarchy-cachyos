@@ -59,7 +59,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.4"
+VERSION="2.5"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -435,7 +435,7 @@ repo_order_ok() {
 }
 
 # Read-only проверка «есть ли snapper config root»: sudo -n, чтобы check
-# не висел на запросе пароля. В apply пароль уже закэширован через sudo -v.
+# не висел на запросе пароля. В apply пароль уже закэширован (или NOPASSWD).
 snapper_ready() {
   # Конфиг читается и без root; этого достаточно для check.
   [[ -f /etc/snapper/configs/root ]] && return 0
@@ -1129,7 +1129,12 @@ cmd_apply() {
     have curl || die "нужен curl для загрузки установщика CachyOS"
     curl -fsI --max-time 15 "$CACHYOS_REPO_URL" >/dev/null 2>&1 ||
       die "нет доступа к $CACHYOS_REPO_URL — проверьте интернет"
-    sudo -v || die "без sudo переход невозможен"
+    # sudo -v спрашивает пароль даже при NOPASSWD и без tty падает
+    # («a terminal is required»). Сначала проверяем, что sudo работает
+    # без пароля; только иначе просим его один раз.
+    if ! sudo -n true 2>/dev/null; then
+      sudo -v || die "без sudo переход невозможен"
+    fi
     start_sudo_keepalive
     trap 'stop_sudo_keepalive; stop_progress' EXIT
   fi
@@ -1192,7 +1197,7 @@ cmd_revert() {
   local bk=$BACKUP_ROOT/pre-conversion
   [[ -f $bk/pacman.conf ]] || die "нет эталонного бэкапа $bk/pacman.conf — откат делайте снапшотом"
 
-  (( DRY )) || sudo -v
+  (( DRY )) || { sudo -n true 2>/dev/null || sudo -v; }
 
   # Сначала ядро: нельзя удалять пакет, на котором система работает.
   if (( ! NO_KERNEL )); then
