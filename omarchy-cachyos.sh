@@ -2,7 +2,7 @@
 # =============================================================================
 #  omarchy-cachyos.sh — перевод свежей Omarchy на репозитории CachyOS
 #
-#  Проверено на Omarchy 4.5.0 (VM): 848 пакетов, 671 (79%) из CachyOS,
+#  Проверено на Omarchy 4.5.0 (VM): 911 пакетов, 707 из CachyOS,
 #  Hyprland 0.56.2-4 и quickshell из [omarchy], shell и лаунчер работают,
 #  `pacman -Syu` закреплённый стек не трогает.
 #
@@ -56,8 +56,9 @@
 #      ./omarchy-cachyos.sh verify
 #      ./omarchy-cachyos.sh revert
 #
-#  apply не задаёт вопросов: один раз спрашивает пароль sudo в начале
-#  (дальше таймстамп продлевается в фоне) и идёт до самой проверки.
+#  apply не задаёт вопросов: один раз спрашивает пароль sudo в начале,
+#  на время работы делает кэш sudo глобальным (временный dropin удаляется
+#  на выходе) и идёт до самой проверки.
 #  Прервать можно Ctrl+C — снапшот к этому моменту уже создан.
 #
 #  После apply нужен перезагруз, чтобы загрузилось ядро CachyOS
@@ -65,7 +66,14 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.8"
+# SSH-команды и cron не читают /etc/profile.d/omarchy.sh, а `omarchy update`
+# без OMARCHY_PATH падает с «OMARCHY_PATH does not match this Omarchy command».
+if [[ -r /usr/share/omarchy/default/bash/env-bootstrap ]]; then
+  . /usr/share/omarchy/default/bash/env-bootstrap
+fi
+export OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
+
+VERSION="2.9"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -80,6 +88,10 @@ NO_MIRRORS=0
 NO_SNAPSHOT=0
 SUDO_KEEPALIVE=""
 PROGRESS_PID=""
+SUDO_DROPIN=""
+TEE_PID=""
+UPDATE_WATCH_PID=""
+VERIFY_RC=0
 
 PACMAN_CONF=${OMARCHY_CACHYOS_PACMAN_CONF:-/etc/pacman.conf}
 BACKUP_ROOT=${OMARCHY_CACHYOS_BACKUP_ROOT:-/var/backups/omarchy-cachyos}
@@ -127,6 +139,10 @@ warn() { say "${c_red} !!${c_reset} $*"; }
 die()  { warn "$*"; exit 1; }
 sect() { say ""; say "${c_cya}── $* ──${c_reset}"; }
 
+# Приглашение sudo заканчивается переводом строки: иначе фоновый индикатор
+# приклеивается к нему и весь вывод выглядит «съехавшим».
+export SUDO_PROMPT=$'[sudo] пароль для %u: \n'
+
 have() { command -v "$1" >/dev/null 2>&1; }
 pkg_installed() { pacman -Q "$1" >/dev/null 2>&1; }
 pkg_ver() { pacman -Q "$1" 2>/dev/null | awk '{print $2}' || true; }
@@ -148,6 +164,41 @@ can_check_boot() {
   [[ -r /boot/limine.conf ]] || sudo -n true 2>/dev/null
 }
 as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
+
+# sudo по умолчанию привязывает кэш пароля к tty. omarchy update запускает
+# свой pty через script(1), поэтому второй раз спрашивает пароль даже после
+# sudo -v в исходном терминале. На время apply кэш делается глобальным —
+# пароль вводится один раз, привилегии не расширяются. Файл удаляется
+# в on_exit даже при ошибке.
+# вызывается ПОСЛЕ sudo -v: пароль уже введён, поэтому dropin ставится
+# без пароля (sudo -n) и второго запроса не будет.
+setup_global_sudo_timestamp() {
+  (( EUID == 0 )) && return 0
+  local f="/etc/sudoers.d/omarchy-cachyos-$$"
+  if ! sudo -n sh -c 'umask 022; printf "Defaults timestamp_type=global\n" > "$1"' _ "$f" 2>/dev/null; then
+    warn "не удалось сделать кэш sudo глобальным — omarchy update может спросить пароль ещё раз"
+    return 0
+  fi
+  SUDO_DROPIN=$f
+  sudo -n true >/dev/null 2>&1 ||
+    warn "глобальный кэш sudo не подтверждён — повторный запрос пароля возможен"
+}
+
+cleanup_sudo_dropin() {
+  [[ -n ${SUDO_DROPIN:-} ]] || return 0
+  as_root rm -f "$SUDO_DROPIN" 2>/dev/null || true
+  SUDO_DROPIN=""
+}
+
+on_exit() {
+  stop_sudo_keepalive
+  stop_progress
+  stop_update_watch
+  cleanup_sudo_dropin
+  # Возвращаем исходный stdout и закрываем конец pipe process substitution.
+  exec >&3 3>&- 2>/dev/null || true
+  [[ -n ${TEE_PID:-} ]] && wait "$TEE_PID" 2>/dev/null || true
+}
 
 confirm() {
   local prompt=${1:-Продолжить?} answer
@@ -197,8 +248,15 @@ start_progress() {
     while sleep 30; do
       local size
       size=$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1 || true)
-      printf '%s    … идёт загрузка/установка, кэш пакетов: %s%s\n' \
-        "$c_yel" "${size:-?}" "$c_reset"
+      # В терминале pacman/omarchy рисуют прогресс через \r; стираем текущую
+      # строку, чтобы наша строка не приклеивалась к их выводу.
+      if (( TTY )); then
+        printf '\r\033[2K%s    … идёт загрузка/установка, кэш пакетов: %s%s\n' \
+          "$c_yel" "${size:-?}" "$c_reset"
+      else
+        printf '%s    … идёт загрузка/установка, кэш пакетов: %s%s\n' \
+          "$c_yel" "${size:-?}" "$c_reset"
+      fi
     done
   ) &
   PROGRESS_PID=$!
@@ -207,6 +265,30 @@ start_progress() {
 stop_progress() {
   [[ -n ${PROGRESS_PID:-} ]] && kill "$PROGRESS_PID" 2>/dev/null || true
   PROGRESS_PID=""
+}
+
+# omarchy update может встать на приглашении sudo (свой pty через script).
+# Следим за логом: появился запрос пароля — завершаем обновление, чтобы
+# скрипт не висел часами и сразу показал понятную причину.
+start_update_watch() {
+  local log=$1 pid=$2
+  (
+    set +E; trap - ERR
+    while sleep 5; do
+      kill -0 "$pid" 2>/dev/null || break
+      if grep -aq '\[sudo\]' "$log"; then
+        warn "омarchy update ждёт пароль sudo — прерываю (проверьте настройки sudo)"
+        pkill -TERM -P "$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        break
+      fi
+    done
+  ) &
+  UPDATE_WATCH_PID=$!
+}
+
+stop_update_watch() {
+  [[ -n ${UPDATE_WATCH_PID:-} ]] && kill "$UPDATE_WATCH_PID" 2>/dev/null || true
+  UPDATE_WATCH_PID=""
 }
 
 # ---------------------------------------------------------------------------
@@ -289,11 +371,11 @@ esac
 
 while (( $# )); do
   case $1 in
-    --arch)        ARCH=${2:?"--arch требует значение"}; shift 2 ;;
+    --arch)        [[ $# -ge 2 ]] || die "--arch требует значение"; ARCH=$2; shift 2 ;;
     --arch=*)      ARCH=${1#*=}; shift ;;
-    --kernel)      KERNEL=${2:?"--kernel требует значение"}; shift 2 ;;
+    --kernel)      [[ $# -ge 2 ]] || die "--kernel требует значение"; KERNEL=$2; shift 2 ;;
     --kernel=*)    KERNEL=${1#*=}; shift ;;
-    --priority)    PRIORITY=${2:?"--priority требует значение"}; shift 2 ;;
+    --priority)    [[ $# -ge 2 ]] || die "--priority требует значение"; PRIORITY=$2; shift 2 ;;
     --priority=*)  PRIORITY=${1#*=}; shift ;;
     --with-nvidia) WITH_NVIDIA=1; shift ;;
     --no-kernel)   NO_KERNEL=1; shift ;;
@@ -322,8 +404,12 @@ LOG="$STATE_DIR/${CMD}-${RUN_ID}.log"
 : >"$LOG"
 TTY=0
 [[ -t 1 ]] && TTY=1
-# Весь вывод (включая pacman/omarchy) пишется в лог и на экран.
-exec > >(tee -a "$LOG") 2>&1
+# Весь вывод (включая pacman/omarchy) пишется в лог и на экран. fd 3 хранит
+# настоящий stdout: перед выходом закрываем pipe process substitution, иначе
+# wait tee висит (запись в pipe ещё открыта самим shell).
+exec 3>&1 > >(tee -a "$LOG") 2>&1
+TEE_PID=$!
+trap on_exit EXIT
 
 # ---------------------------------------------------------------------------
 # определение CPU / ISA
@@ -331,7 +417,7 @@ exec > >(tee -a "$LOG") 2>&1
 ld_supports() {
   local ld=/lib/ld-linux-x86-64.so.2
   [[ -x $ld ]] || ld=/lib64/ld-linux-x86-64.so.2
-  [[ -x $ld ]] && "$ld" --help 2>/dev/null | grep -q "$1 (supported, searched)"
+  [[ -x $ld ]] && LC_ALL=C "$ld" --help 2>/dev/null | grep -q "$1 (supported, searched)"
 }
 
 cpu_flags() { awk -F': ' '/^flags[[:space:]]*:/{print " "$2" "; exit}' /proc/cpuinfo; }
@@ -401,9 +487,9 @@ preflight() {
   have pacman || die "pacman не найден — это не Arch-based система"
   [[ -r $PACMAN_CONF ]] || die "не читается $PACMAN_CONF"
 
-  if [[ -e /var/lib/pacman/db.lck ]]; then
-    warn "найден /var/lib/pacman/db.lck — возможно, работает другой pacman"
-    (( DRY )) || die "дождитесь завершения другого pacman"
+  # check/verify только читают базу — им можно работать и при db.lck.
+  if [[ $CMD == apply && -e /var/lib/pacman/db.lck ]]; then
+    (( DRY )) || die "есть /var/lib/pacman/db.lck — дождитесь завершения другого pacman"
   fi
 
   if ! pkg_installed omarchy; then
@@ -412,8 +498,13 @@ preflight() {
 
   local avail
   avail=$(df -Pk /var 2>/dev/null | awk 'NR==2{print int($4/1048576)}')
-  if [[ ${avail:-0} -lt 6 ]]; then
-    warn "на /var свободно ${avail:-?} ГБ; для массового апгрейда желательно ≥6 ГБ"
+  # omarchy update сам отказывается работать при свободном месте <10 GiB —
+  # лучше сказать об этом до снапшота и бэкапов, а не после 1.7 ГБ загрузки.
+  if [[ ${avail:-0} -lt 10 ]]; then
+    if [[ $CMD == apply && ! DRY ]]; then
+      die "на /var свободно ${avail:-?} ГБ, а omarchy update требует минимум 10 GiB — освободите место"
+    fi
+    warn "на /var свободно ${avail:-?} ГБ; omarchy update потребует ≥10 GiB"
   fi
 }
 
@@ -770,15 +861,14 @@ do_mirrors() {
   # После установщика базы ещё не синхронизированы под новый Architecture;
   # без -Sy пакет cachyos-rate-mirrors не найдётся.
   as_root pacman -Sy --noconfirm ||
-    { warn "не удалось синхронизировать базы — зеркала не ранжирую"; return; }
+    die "не удалось синхронизировать базы — ранжирование зеркал невозможно"
   as_root pacman -S --needed --noconfirm cachyos-rate-mirrors ||
-    { warn "не удалось поставить cachyos-rate-mirrors"; return; }
+    die "не удалось поставить cachyos-rate-mirrors"
 
   info "ранжирую зеркала (может занять несколько минут)..."
-  if ! as_root cachyos-rate-mirrors; then
-    warn "cachyos-rate-mirrors завершился с ошибкой — списки остались прежними"
-    return
-  fi
+  as_root cachyos-rate-mirrors ||
+    die "не удалось ранжировать зеркала — продолжать с неотранжированными списками небезопасно"
+  rank_variant_mirrorlist
   as_root systemctl enable --now cachyos-rate-mirrors.timer 2>/dev/null || true
   msg "зеркала отранжированы, таймер включён"
   grep -m3 '^Server' /etc/pacman.d/cachyos-mirrorlist 2>/dev/null | sed 's/^/    /' || true
@@ -790,34 +880,75 @@ do_mirrors() {
 # 10 секунд без байтов, объявляет хост битым и в итоге отказывается коммитить
 # («failed to commit transaction»), хотя часть пакетов уже скачана. Поэтому
 # проблемный хост комментируем в mirrorlist и повторяем — докачка дешёвая.
-MIRRORLISTS=(/etc/pacman.d/mirrorlist /etc/pacman.d/cachyos-mirrorlist)
+# Важно: znver4/v4-пакеты идут через cachyos-v4-mirrorlist, v3 — через
+# cachyos-v3-mirrorlist; карантить только общий cachyos-mirrorlist бесполезно.
+ALL_MIRRORLISTS=(
+  /etc/pacman.d/mirrorlist
+  /etc/pacman.d/cachyos-mirrorlist
+  /etc/pacman.d/cachyos-v3-mirrorlist
+  /etc/pacman.d/cachyos-v4-mirrorlist
+)
+
+variant_mirrorlist() {
+  [[ $ARCH == v3 ]] && echo /etc/pacman.d/cachyos-v3-mirrorlist ||
+    echo /etc/pacman.d/cachyos-v4-mirrorlist
+}
+
+# cachyos-rate-mirrors ранжирует только cachyos-mirrorlist ($arch). Списки
+# v3/v4 ($arch_v3/$arch_v4) остаются в порядке «как пришли» — а именно оттуда
+# качается основная масса znver4-пакетов. Переносим отранжированный порядок
+# на вариант, сохраняя его подстановку $arch_v4/$arch_v3.
+rank_variant_mirrorlist() {
+  local generic=/etc/pacman.d/cachyos-mirrorlist target line tmp n
+  [[ -f $generic ]] || return 0
+  target=$(variant_mirrorlist)
+  [[ -f $target ]] || return 0
+  tmp=$(mktemp)
+  {
+    printf '## omarchy-cachyos: порядок от cachyos-rate-mirrors\n\n'
+    while IFS= read -r line; do
+      [[ $line == 'Server = '* ]] || continue
+      if [[ $ARCH == v3 ]]; then
+        printf '%s\n' "${line//'$arch'/'$arch_v3'}"
+      else
+        printf '%s\n' "${line//'$arch'/'$arch_v4'}"
+      fi
+    done <"$generic"
+  } >"$tmp"
+  n=$(grep -c '^Server = ' "$tmp" || true)
+  if (( n < 3 )); then
+    warn "в $(basename "$target") меньше 3 зеркал после переноса ранжирования — оставляю список как был"
+    rm -f "$tmp"
+    return 0
+  fi
+  as_root install -m 0644 "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  info "порядок $(basename "$target") приведён к отранжированным зеркалам ($n)"
+}
 
 quarantine_host() {
-  local host=$1 esc f hit=1
+  local host=$1 esc f enabled hit=1
   esc=${host//./\\.}
-  for f in "${MIRRORLISTS[@]}"; do
+  for f in "${ALL_MIRRORLISTS[@]}"; do
     [[ -f $f ]] || continue
-    as_root grep -qE "^Server = https?://${esc}/" "$f" || continue
-    as_root sed -i -E "s|^Server = (https?://${esc}/)|\#Server = \1|" "$f"
-    info "карантин: $host"
-    hit=0
-  done
-  # если карантин опустошил список, вернуть его целиком: остаться вообще без
-  # зеркал хуже, чем пользоваться медленным
-  for f in "${MIRRORLISTS[@]}"; do
-    [[ -f $f ]] || continue
-    if ! grep -qE '^Server = ' "$f"; then
-      as_root sed -i -E 's|^#Server = |Server = |' "$f"
-      warn "в $f не осталось зеркал — возвращаю список как был"
+    as_root grep -qE "^[[:space:]]*Server = https?://${esc}/" "$f" || continue
+    enabled=$(grep -cE '^[[:space:]]*Server = ' "$f" || true)
+    if (( enabled <= 1 )); then
+      warn "не трогаю $host: последнее активное зеркало в $(basename "$f")"
+      continue
     fi
+    as_root sed -i -E "s|^([[:space:]]*)Server = (https?://${esc}/)|\1#Server = \2|" "$f"
+    info "карантин: $host ($(basename "$f"))"
+    hit=0
   done
   return $hit
 }
 
 demote_bad_mirrors() {
   local log=$1 hosts host hit=1
-  hosts=$(grep -aoE '(failed retrieving file .* from|too many errors from) [A-Za-z0-9._-]+' "$log" 2>/dev/null |
-            grep -aoE '[A-Za-z0-9._-]+$' | sort -u || true)
+  # omarchy update запускается с LC_ALL=C, поэтому сообщения pacman английские.
+  hosts=$(grep -aE 'failed retrieving file|too many errors' "$log" 2>/dev/null |
+            grep -aoE 'from [A-Za-z0-9._-]+' | awk '{print $2}' | sort -u || true)
   [[ -n $hosts ]] || return 1
   while read -r host; do
     [[ -n $host ]] || continue
@@ -830,42 +961,73 @@ demote_bad_mirrors() {
 
 # cachyos-rate-mirrors меряет скорость по .db, а база маленькая и часто уже в
 # кэше зеркала: хост может отдавать её мгновенно и «стоять» на пакетах.
-# Проверяем первые три зеркала настоящим пакетом (первые 256 КиБ).
+# Проверяем настоящим пакетом активные зеркала (v3/v4 и общий список).
+# Порог ОТНОСИТЕЛЬНЫЙ: на медленном канале все зеркала дают 40–50 КиБ/с,
+# каратинить их бессмысленно — хуже остаться вообще без зеркал.
 probe_slow_mirrors() {
-  local pkg url rel repo arch file srv u code speed host
-  local -a servers=()
-  pkg=$(LC_ALL=C pacman -Sl cachyos-extra-znver4 2>/dev/null | awk 'NR==1{print $2}')
-  [[ -n ${pkg:-} ]] || pkg=$(LC_ALL=C pacman -Sl cachyos 2>/dev/null | awk 'NR==1{print $2}')
-  [[ -n ${pkg:-} ]] || return 0
-  url=$(LC_ALL=C pacman -Sp --print-format '%l' "$pkg" 2>/dev/null |
-          grep -m1 '/cachyos/repo/' || true)
+  local repo p url rel file repo_name arch_token srv u code speed size host best=0
+  local -a servers=() results=() result hs hv
+  for repo in "cachyos-extra-$ARCH" cachyos-extra-znver4 cachyos-extra-v4 \
+              cachyos-extra-v3 cachyos; do
+    if LC_ALL=C pacman -Sl "$repo" >/dev/null 2>&1; then
+      p=$(LC_ALL=C pacman -Sl "$repo" | awk 'NR==1{print $2}')
+      [[ -n ${p:-} ]] && break
+    fi
+  done
+  [[ -n ${p:-} ]] || return 0
+  # pacman -Sp печатает URL и зависимостей (в том числе Arch). Нужен именно
+  # v4/v3-пакет: по его имени видно и архитектуру, и репозиторий. Хост может
+  # быть cdn77.cachyos.org/repo/... — искать '/cachyos/repo/' нельзя.
+  local want=v4; [[ $ARCH == v3 ]] && want=v3
+  url=$(LC_ALL=C pacman -Sp --print-format '%l' "$p" 2>/dev/null |
+          grep -m1 "x86_64_${want}\.pkg\.tar\.zst" || true)
+  [[ -n $url ]] || url=$(LC_ALL=C pacman -Sp --print-format '%l' "$p" 2>/dev/null |
+          grep -m1 -E 'cachyos[^/]*/repo/|/cachyos/repo/' || true)
   [[ -n $url ]] || return 0
   rel=${url#*://}; rel=${rel#*/}
   file=${rel##*/}
-  repo=${rel%/*}; repo=${repo##*/}
-  arch=$(awk -F/ '{for (i = 2; i < NF; i++) if ($i == "repo") { print $(i + 1); exit }}' <<<"$rel")
-  [[ -n $arch ]] || return 0
+  repo_name=${rel%/*}; repo_name=${repo_name##*/}
+  arch_token=$(awk -F/ '{for (i = 1; i < NF; i++) if ($i == "repo") { print $(i + 1); exit }}' <<<"$rel")
+  [[ -n $arch_token ]] || return 0
 
-  while IFS= read -r srv; do servers+=("$srv"); done < <(grep -m3 -E '^Server = ' /etc/pacman.d/cachyos-mirrorlist 2>/dev/null)
+  # Сначала вариант (оттуда идут znver4-пакеты), потом общий список.
+  while IFS= read -r srv; do servers+=("$srv"); done < <(
+    { grep -m3 '^Server = ' "$(variant_mirrorlist)" 2>/dev/null || true
+      grep -m2 '^Server = ' /etc/pacman.d/cachyos-mirrorlist 2>/dev/null || true
+    } | awk '!seen[$0]++'
+  )
   (( ${#servers[@]} )) || return 0
 
   info "проверяю скорость зеркал на настоящем пакете ($file)..."
   for srv in "${servers[@]}"; do
     srv=${srv#Server = }
-    u=${srv//\$arch/$arch}; u=${u//\$repo/$repo}
+    u=${srv//'$arch_v4'/$arch_token}
+    u=${u//'$arch_v3'/$arch_token}
+    u=${u//'$arch'/$arch_token}
+    u=${u//'$repo'/$repo_name}
     u=${u%/}/$file
-    read -r code speed < <(curl -o /dev/null -sS --max-time 8 -r 0-262143 \
-      -w '%{http_code} %{speed_download}\n' "$u" 2>/dev/null || printf '000 0\n') || true
-    case ${code:-000} in
-      2*) ;;
-      *) continue ;;   # 404 — зеркало ещё не синхронизировалось, это не «медленно»
-    esac
+    read -r code speed size < <(curl -o /dev/null -sS --max-time 8 -r 0-262143 \
+      -w '%{http_code} %{speed_download} %{size_download}\n' "$u" 2>/dev/null ||
+      printf '000 0 0\n') || true
+    case ${code:-000} in 2*) ;; *) continue ;; esac  # 404 — не «медленно»
+    [[ ${size:-0} =~ ^[0-9]+$ ]] && (( size > 0 )) || continue
     host=${srv#*://}; host=${host%%/*}
-    if awk -v s="${speed:-0}" 'BEGIN { exit !(s < 100000) }'; then
-      warn "медленно на пакете: $host ($(awk -v s="${speed:-0}" 'BEGIN{printf "%.0f", s/1024}') КиБ/с)"
-      quarantine_host "$host" || true
+    speed=${speed:-0}
+    results+=("$host|$speed")
+    awk -v s="$speed" -v b="$best" 'BEGIN{exit !(s > b)}' && best=$speed
+  done
+  (( ${#results[@]} > 1 )) || return 0
+  if awk -v b="$best" 'BEGIN{exit !(b < 100000)}'; then
+    info "все зеркала медленные ($(awk -v b="$best" 'BEGIN{printf "%.0f", b/1024}') КиБ/с) — это канал, карантин не применяю"
+    return 0
+  fi
+  for result in "${results[@]}"; do
+    IFS='|' read -r hs hv <<<"$result"
+    if awk -v s="$hv" -v b="$best" 'BEGIN{exit !(s*2 < b)}'; then
+      warn "медленно на пакете: $hs ($(awk -v s="$hv" 'BEGIN{printf "%.0f", s/1024}') КиБ/с)"
+      quarantine_host "$hs" || true
     else
-      info "быстро: $host ($(awk -v s="${speed:-0}" 'BEGIN{printf "%.0f", s/1024}') КиБ/с)"
+      info "быстро: $hs ($(awk -v s="$hv" 'BEGIN{printf "%.0f", s/1024}') КиБ/с)"
     fi
   done
 }
@@ -886,9 +1048,21 @@ do_update() {
     start_progress
     rc=0
     # Вывод идёт и в терминал, и в лог: по нему видно, на каком зеркале
-    # pacman споткнулся, чтобы увести именно его в карантин.
-    omarchy update -y 2>&1 | tee "$log" || rc=$?
+    # pacman споткнулся, чтобы увести именно его в карантин. LC_ALL=C нужен
+    # для парсинга сообщений pacman. Таймаут страхует от вечного ожидания.
+    (
+      set -o pipefail
+      LC_ALL=C timeout --foreground --kill-after=30s \
+        "${OMARCHY_CACHYOS_UPDATE_TIMEOUT:-7200}" omarchy update -y 2>&1 | tee "$log"
+    ) &
+    local upd_pid=$!
+    start_update_watch "$log" "$upd_pid"
+    wait "$upd_pid" || rc=$?
+    stop_update_watch
     stop_progress
+    if (( rc == 124 || rc == 137 || rc == 143 )); then
+      die "omarchy update прерван таймаутом/ожиданием ввода (код $rc) — см. $LOG"
+    fi
     if (( rc == 0 )); then
       rm -f "$log"
       return 0
@@ -944,11 +1118,16 @@ do_kernel() {
     return
   fi
 
-  if pkg_installed "$KERNEL"; then
-    info "$KERNEL уже установлен ($(pkg_ver "$KERNEL"))"
-  else
+  local missing=0 p
+  for p in "${pkgs[@]}"; do
+    pkg_installed "$p" || missing=1
+  done
+  if (( missing )); then
+    # Завершать нужно и headers/nvidia, даже если само ядро уже стоит.
     as_root pacman -S --needed --noconfirm "${pkgs[@]}" ||
-      die "не удалось установить $KERNEL"
+      die "не удалось установить $KERNEL и его модули"
+  else
+    info "$KERNEL и его модули уже установлены ($(pkg_ver "$KERNEL"))"
   fi
 
   local cur
@@ -967,9 +1146,13 @@ do_kernel() {
     info "ядро по умолчанию уже $KERNEL"
   fi
 
-  [[ -f /boot/limine.conf ]] &&
-    { as_root grep -q "kernel-id=$KERNEL" /boot/limine.conf ||
-      warn "в /boot/limine.conf нет записи kernel-id=$KERNEL"; }
+  # Прямой [[ -f /boot/limine.conf ]] под set -e падает, если /boot закрыт.
+  if boot_file /boot/limine.conf; then
+    as_root grep -q "kernel-id=$KERNEL" /boot/limine.conf ||
+      warn "в /boot/limine.conf нет записи kernel-id=$KERNEL"
+  else
+    info "/boot/limine.conf недоступен для проверки — запись ядра не проверена"
+  fi
   # Omarchy грузит ядро либо через limine-entry-tool (path/module_path в /boot),
   # либо через UKI в /boot/EFI/Linux — проверяем UKI, только если он вообще есть.
   if boot_dir /boot/EFI/Linux && ! boot_file "/boot/EFI/Linux/omarchy_${KERNEL}.efi"; then
@@ -986,17 +1169,22 @@ repo_counts() {
   pacman -Q >"$ti"
   local -a repos
   mapfile -t repos < <(pconf --repo-list)
+  # pacman -Sl печатает репозитории в порядке аргументов: первое совпадение
+  # и есть реальный источник пакета, даже если версия есть ещё в двух repo.
   pacman -Sl "${repos[@]}" >"$tc" 2>/dev/null || true
   awk '
     NR == FNR { ver[$1]=$2; next }
-    ($2 in ver) && ver[$2] == $3 { c[$1]++ }
+    ($2 in ver) && ver[$2] == $3 && !seen[$2]++ { c[$1]++ }
     END { for (r in c) printf "  %-26s %5d\n", r, c[r] }
   ' "$ti" "$tc" | sort -k2 -nr
   rm -f "$ti" "$tc"
 }
 
+verify_fail() { warn "$*"; VERIFY_RC=1; }
+
 cmd_verify() {
   preflight
+  VERIFY_RC=0
   local level
   level=$(resolve_arch)
 
@@ -1011,14 +1199,14 @@ cmd_verify() {
   if has_cachyos_repos; then
     msg "репозитории CachyOS на месте"
   else
-    warn "репозиториев CachyOS нет"
+    verify_fail "репозиториев CachyOS нет"
   fi
 
   sect "Зависимости"
   if pacman -Dk >/dev/null 2>&1; then
     msg "pacman -Dk: битых зависимостей нет"
   else
-    warn "pacman -Dk нашёл проблемы:"
+    verify_fail "pacman -Dk нашёл проблемы:"
     pacman -Dk 2>&1 | sed 's/^/    /' || true
   fi
 
@@ -1037,7 +1225,7 @@ cmd_verify() {
       elif [[ $v == "$om" ]]; then
         info "$p: $v — сборка Omarchy"
       else
-        warn "$p: $v, в [omarchy] $om — возможно, подменён"
+        verify_fail "$p: $v, в [omarchy] $om — возможно, подменён"
       fi
     done
 
@@ -1050,7 +1238,7 @@ cmd_verify() {
         if [[ $base == "${req%-*}" ]]; then
           info "titlebars: hyprland $base соответствует требованию $req"
         else
-          warn "titlebars требует hyprland=$req, установлен $(pkg_ver hyprland)"
+          verify_fail "titlebars требует hyprland=$req, установлен $(pkg_ver hyprland)"
         fi
       fi
     fi
@@ -1067,7 +1255,7 @@ cmd_verify() {
     bad=$(awk 'NR==FNR{p[$1]=1; next} !/\[ignored\]/ && ($1 in p){print}' \
           "$STATE_DIR/pins-verify.txt" "$tmpu")
     if [[ -n $bad ]]; then
-      warn "пины предлагаются к обновлению без [ignored]:"
+      verify_fail "пины предлагаются к обновлению без [ignored]:"
       printf '%s\n' "$bad" | sed 's/^/    /'
     else
       msg "закреплённые пакеты обновляться не будут"
@@ -1101,19 +1289,25 @@ cmd_verify() {
     warn "quickshell не запущен"
   fi
   local failed
-  failed=$(systemctl --failed --no-legend 2>/dev/null | wc -l)
+  failed=$({ systemctl --failed --no-legend 2>/dev/null || true; } | wc -l)
   (( failed == 0 )) && msg "упавших systemd-юнитов нет" || warn "упавших юнитов: $failed"
 
   local sig
   sig=$(find "${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true)
   if [[ -n $sig ]] && have hyprctl; then
     local errs
-    errs=$(HYPRLAND_INSTANCE_SIGNATURE=$(basename "$sig") hyprctl configerrors 2>/dev/null || true)
-    if [[ -z $errs ]]; then
-      msg "hyprctl configerrors пуст"
+    # configerrors может вернуть пустоту просто потому, что сокет не ответил:
+    # сначала убеждаемся, что hyprctl реально говорит с сессией.
+    if HYPRLAND_INSTANCE_SIGNATURE=$(basename "$sig") hyprctl version >/dev/null 2>&1; then
+      errs=$(HYPRLAND_INSTANCE_SIGNATURE=$(basename "$sig") hyprctl configerrors 2>&1 || true)
+      if [[ -z $errs || $errs == *'Config errors: 0'* ]]; then
+        msg "hyprctl configerrors пуст"
+      else
+        verify_fail "ошибки конфигурации Hyprland:"
+        printf '%s\n' "$errs" | sed 's/^/    /'
+      fi
     else
-      warn "ошибки конфигурации Hyprland:"
-      printf '%s\n' "$errs" | sed 's/^/    /'
+      info "hyprctl не отвечает из этого окружения — проверьте из сессии"
     fi
   else
     info "hyprctl недоступен из этого окружения — проверьте из сессии"
@@ -1121,7 +1315,7 @@ cmd_verify() {
 
   sect "Откуда пакеты"
   info "всего установлено: $(pacman -Qq | wc -l)"
-  info "точное совпадение версий; при равных версиях в двух репозиториях пакет считается дважды"
+  info "точное совпадение версий; источник — первый по приоритету репозиторий с такой версией"
   repo_counts
 
   sect "Итог"
@@ -1130,6 +1324,7 @@ cmd_verify() {
   else
     info "сейчас загружено $(uname -r); после перезагрузки будет $KERNEL"
   fi
+  return $VERIFY_RC
 }
 
 # ---------------------------------------------------------------------------
@@ -1193,7 +1388,7 @@ cmd_check() {
   if have snapper && snapper_ready; then
     info "snapper: config root есть ($(findmnt -no FSTYPE /))"
   else
-    warn "snapper не настроен или нужен sudo — apply попросит подтверждение без снапшота"
+    warn "snapper не настроен или нужен sudo — apply остановится; осознанный обход: --no-snapshot"
   fi
   info "свободно на /var: $(df -Ph /var 2>/dev/null | awk 'NR==2{print $4}')"
 
@@ -1202,11 +1397,11 @@ cmd_check() {
   1. снапшот snapper и бэкап /etc/pacman.conf -> $BACKUP_ROOT
   2. IgnorePkg: ${want:-...}
   3. $([[ -n $(grep -E '^\[cachyos' "$PACMAN_CONF") ]] && echo 'репозитории CachyOS уже есть — только нормализация' || echo 'официальный установщик репозиториев CachyOS')
-  4. Architecture = $(arch_value "$level"), приоритет: $PRIORITY
-  5. $([[ $NO_MIRRORS == 1 ]] && echo 'зеркала: пропуск' || echo 'ранжирование зеркал cachyos-rate-mirrors')
-  6. omarchy update
-  7. $([[ $NO_KERNEL == 1 ]] && echo 'ядро: пропуск' || echo "ядро $KERNEL -> дефолт")
-  8. verify
+  4. Architecture = $(arch_value "$level"), приоритет: $PRIORITY (после update перепроверяется)
+  5. $([[ $NO_MIRRORS == 1 ]] && echo 'зеркала: пропуск' || echo 'ранжирование cachyos-rate-mirrors + перенос порядка на v4/v3-список + проба пакетом')
+  6. omarchy update (при ошибке — карантин плохих зеркал и повтор до 3 раз)
+  7. $([[ $NO_KERNEL == 1 ]] && echo 'ядро: пропуск' || echo "ядро $KERNEL (+ headers/модули) -> дефолт")
+  8. verify (при ошибке apply не считается завершённым и --reboot не выполняется)
 EOF
   say ""
   info "ничего не изменено (это check). Для перехода: $0 (apply по умолчанию)"
@@ -1250,10 +1445,13 @@ cmd_apply() {
     # («a terminal is required»). Сначала проверяем, что sudo работает
     # без пароля; только иначе просим его один раз.
     if ! sudo -n true 2>/dev/null; then
-      sudo -v || die "без sudo переход невозможен"
+      # Пароль вводится один раз здесь. Затем (уже по кэшу) ставим dropin с
+      # timestamp_type=global: omarchy update запускает sudo в своём pty и
+      # без этого спросил бы пароль второй раз.
+      sudo -v || die "без sudo переход невозможен (нужен tty или NOPASSWD)"
+      setup_global_sudo_timestamp
     fi
     start_sudo_keepalive
-    trap 'stop_sudo_keepalive; stop_progress' EXIT
   fi
 
   countdown
@@ -1275,13 +1473,23 @@ cmd_apply() {
   do_kernel
 
   if (( ! DRY )); then
-    cmd_verify || true
+    # Ошибку проверки больше не гасим: без неё «переход выполнен» был бы ложью.
+    if cmd_verify; then
+      VERIFY_RC=0
+    else
+      VERIFY_RC=$?
+      warn "проверка не прошла (код $VERIFY_RC) — переход считается незавершённым"
+      warn "лог: $LOG"
+    fi
   fi
 
   sect "Готово"
   if (( DRY )); then
     msg "dry-run завершён: изменения не вносились"
     return 0
+  fi
+  if (( VERIFY_RC != 0 )); then
+    die "переход прерван: проверка не прошла; --reboot отменён"
   fi
   msg "переход выполнен"
   info "лог: $LOG"
@@ -1309,19 +1517,34 @@ cmd_status() {
 cmd_revert() {
   (( EUID == 0 )) && die "Запускайте от обычного пользователя (скрипт сам вызывает sudo)"
   preflight
-  confirm "Убрать репозитории CachyOS и вернуть штатное ядро?" || exit 0
+  confirm "Убрать репозитории CachyOS и вернуть штатное ядро?" || return 0
 
   local bk=$BACKUP_ROOT/pre-conversion
-  [[ -f $bk/pacman.conf ]] || die "нет эталонного бэкапа $bk/pacman.conf — откат делайте снапшотом"
+  # Каталог бэкапов 0700 root: обычный пользователь не может даже stat-ить.
+  as_root test -f "$bk/pacman.conf" ||
+    die "нет эталонного бэкапа $bk/pacman.conf — откат делайте снапшотом"
 
   (( DRY )) || { sudo -n true 2>/dev/null || sudo -v; }
+
+  # Берём из метаданных последнего apply: ядро могло быть не по умолчанию,
+  # а снапшот нельзя угадывать из SNAP_ID другого процесса.
+  local runbk="" d meta="" revert_kernel=$KERNEL revert_snap=""
+  while IFS= read -r d; do
+    [[ -n $d ]] || continue
+    if as_root test -f "$d/meta.env"; then runbk=$d; break; fi
+  done < <(as_root find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r)
+  if [[ -n $runbk ]]; then
+    meta=$(as_root cat "$runbk/meta.env" 2>/dev/null || true)
+    revert_kernel=$(awk -F= '$1=="kernel" && $2 != "" {print $2; exit}' <<<"$meta")
+    revert_snap=$(awk -F= '$1=="snapshot" && $2 != "" {print $2; exit}' <<<"$meta")
+    [[ -n $revert_kernel ]] || revert_kernel=$KERNEL
+  fi
 
   # Сначала ядро: нельзя удалять пакет, на котором система работает.
   if (( ! NO_KERNEL )); then
     if pkg_installed linux-omarchy; then
       info "возвращаю дефолт на linux-omarchy"
       if (( ! DRY )); then
-        # Как в apply: не полагаемся на tty/pkexec, root-путь предсказуем.
         as_root /usr/bin/omarchy-kernel set linux-omarchy || warn "omarchy kernel set не сработал"
         have omarchy-state && omarchy-state set reboot-required 2>/dev/null || true
       fi
@@ -1331,25 +1554,51 @@ cmd_revert() {
   fi
 
   if (( DRY )); then
-    info "[dry-run] восстановить $bk/pacman.conf"
+    info "[dry-run] восстановить $bk/pacman.conf и mirrorlist'ы из $runbk"
   else
     as_root install -m 0644 -o root -g root "$bk/pacman.conf" "$PACMAN_CONF"
     as_root cp -a "$bk/pacman.conf" "$BACKUP_ROOT/pacman.conf.reverted.$(date +%s)"
     msg "pacman.conf восстановлен (репозитории CachyOS и пины убраны)"
+    # Без этого карантин останется и таймер снова ранжирует зеркала.
+    local f bn
+    for f in /etc/pacman.d/mirrorlist /etc/pacman.d/cachyos-mirrorlist \
+             /etc/pacman.d/cachyos-v3-mirrorlist /etc/pacman.d/cachyos-v4-mirrorlist; do
+      bn=$(basename "$f")
+      [[ -n $runbk ]] || continue
+      if as_root test -f "$runbk/$bn"; then
+        as_root install -m 0644 "$runbk/$bn" "$f" &&
+          info "mirrorlist восстановлен: $bn"
+      fi
+    done
+    as_root systemctl disable --now cachyos-rate-mirrors.timer 2>/dev/null || true
+    msg "зеркала и карантин сброшены, таймер ранжирования выключен"
   fi
 
-  if pkg_installed "$KERNEL"; then
+  if pkg_installed "$revert_kernel"; then
     if [[ $(uname -r) == *cachyos* ]]; then
-      warn "сейчас загружено CachyOS-ядро; после перезагрузки запустите revert ещё раз, чтобы удалить $KERNEL"
+      warn "сейчас загружено CachyOS-ядро; после перезагрузки запустите revert ещё раз, чтобы удалить $revert_kernel"
     else
-      confirm "Удалить пакеты ядра $KERNEL?" && {
-        (( DRY )) || as_root pacman -Rns --noconfirm "$KERNEL" "${KERNEL}-headers" 2>/dev/null || true
-      }
+      if confirm "Удалить пакеты ядра $revert_kernel?"; then
+        local -a rm_pkgs=()
+        for d in "$revert_kernel" "${revert_kernel}-headers" \
+                 "${revert_kernel}-nvidia" "${revert_kernel}-nvidia-open"; do
+          pkg_installed "$d" && rm_pkgs+=("$d")
+        done
+        if (( ${#rm_pkgs[@]} )); then
+          if (( DRY )); then
+            info "[dry-run] pacman -Rns ${rm_pkgs[*]}"
+          elif as_root pacman -Rns --noconfirm "${rm_pkgs[@]}"; then
+            msg "ядро и модули удалены: ${rm_pkgs[*]}"
+          else
+            warn "не удалось удалить ${rm_pkgs[*]} — сделайте это вручную"
+          fi
+        fi
+      fi
     fi
   fi
 
   info "пакеты, собранные CachyOS, останутся до следующего обновления из Arch"
-  info "точный откат: меню Limine → Snapshots → снапшот #${SNAP_ID:-<номер>}, либо"
+  info "точный откат: меню Limine → Snapshots → снапшот #${revert_snap:-<номер>}, либо"
   info "  sudo snapper --ambit classic -c root rollback <N>"
   msg "готово"
 }
@@ -1358,7 +1607,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   case $CMD in
     check)  cmd_check ;;
     apply)  cmd_apply ;;
-    verify) cmd_verify ;;
+    verify) cmd_verify || exit $? ;;
     status) cmd_status ;;
     revert) cmd_revert ;;
   esac

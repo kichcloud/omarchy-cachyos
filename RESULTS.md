@@ -1,0 +1,274 @@
+# Результаты теста Omarchy + CachyOS в VM
+
+Дата: 2026-11-24. Домен libvirt `archlinux` (qemu:///session), Omarchy 4.5.0.
+Проверял агент по SSH (проброс порта 2222 → 22 через QEMU-монитор, т.к.
+libvirt 12.9 принимает `<portForward>` только с passt).
+
+## Текущее состояние: «фаза 4» — CachyOS + штатный Hyprland-стек
+
+| Параметр | Значение |
+|---|---|
+| ядро | **7.3.6-1-cachyos** (загружается по умолчанию) |
+| hyprland | 0.56.2-4 (штатный, Arch x86_64) |
+| aquamarine / hyprgraphics | 0.15.1-1 / 0.5.1-4 |
+| hyprutils / hyprlang / hyprcursor | 0.14.2-1 / 0.6.8-5 / 0.1.13-7 |
+| hyprtoolkit / hyprland-guiutils | 0.6.0-1 / 0.2.2-4 |
+| xdg-desktop-portal-hyprland | 1.4.1-2 |
+| quickshell | 0.3.2.r7.g2b4501a-1 (omarchy) |
+| omarchy-hyprland-titlebars | 0.2.2-2 (установлен) |
+| libjxl | 0.12.0-1 (под hyprgraphics 0.5.1) |
+| пакетов всего | 848 |
+| из CachyOS znver4 | 671 (79 %): extra 477, core 124, znver4 40, cachyos 30 |
+| состояние | shell работает, ошибок нет, `pacman -Syu` стек не трогает |
+
+## Итог по фазам
+
+| Фаза | Что сделано | Итог |
+|---|---|---|
+| 1 (`snapshot 4`) | CachyOS-репозитории + IgnorePkg на Hyprland-стек | работает, стек штатный, 599+ пакетов из CachyOS |
+| 2 (`snapshot 5`) | снят пин, весь Hyprland-стек из CachyOS (0.57.2) | работает, но titlebars удалены |
+| 4 (`snapshot 8`) | возврат штатного стека из Arch-архива при ядре и пакетах CachyOS | **рабочее состояние, выбрано как основное** |
+
+Фаза 4 отличается от фазы 1 только способом получения: пакеты стека взяты
+из `archive.archlinux.org` (те же версии, что были при установке Omarchy),
+поэтому `snapper rollback` не понадобился.
+
+## Ядро: как работает штатно
+
+`omarchy kernel get` → `linux-cachyos`; `omarchy kernel list` → оба ядра;
+`omarchy kernel set <имя>` пишет `BOOT_ORDER` в `/etc/default/limine` и
+пересобирает UKI. При установке нового ядра Omarchy ставит его первым сама,
+ручная правка `default_entry` не нужна (и вредна — сбрасывается при
+регенерации `limine.conf`).
+
+## Репозитории и зеркала
+
+`[cachyos-znver4]`, `[cachyos-core-znver4]`, `[cachyos-extra-znver4]`,
+`[cachyos]`, затем `[omarchy]`, `[core]`, `[extra]`, `[multilib]`.
+`Architecture = x86_64 x86_64_v3 x86_64_v4` (см. грабли №1).
+Зеркала отранжированы `cachyos-rate-mirrors` 0.33.0, таймер
+`cachyos-rate-mirrors.timer` включён; бэкапы `*-mirrorlist-backup` на месте.
+
+## Почему znver4, а не generic v4
+
+- znver4 = `-march=znver4`, надмножество x86-64-v4 (плюс VBMI/VBMI2/VNNI/
+  BITALG/GFNI/BF16 и планировщик Zen 4). Оба варианта помечены `x86_64_v4`.
+- В бинарниках есть инструкции сверх v4 (`vpermb` в openssl, libc, bash),
+  поэтому znver4-пакеты не переносимы на Skylake-X и подобные CPU, но на
+  Zen 4/5 работают и чуть быстрее.
+- Здесь CPU гостя — `host-passthrough` (Ryzen 5 7400F), так что znver4 выбран
+  официальным `cachyos-repo.sh` и оставлен.
+
+## Пины (IgnorePkg)
+
+В `/etc/pacman.conf` закреплено, чтобы CachyOS не подменил омрачные сборки:
+
+```
+IgnorePkg = hyprland hyprland-guiutils hyprtoolkit aquamarine hyprgraphics
+            hyprutils hyprlang hyprcursor hyprwayland-scanner
+            xdg-desktop-portal-hyprland quickshell walker
+            omarchy-hyprland-titlebars libjxl
+            limine-mkinitcpio-hook limine-snapper-sync ghostty
+```
+
+- Hyprland-стек + `libjxl` — из-за `omarchy-hyprland-titlebars` (требует 0.56.2).
+- `quickshell`, `limine-mkinitcpio-hook`, `limine-snapper-sync`, `ghostty`,
+  `walker` — омрачные сборки, которые CachyOS тоже предоставляет; при более
+  высокой версии pacman заменил бы их без пина.
+- `limine-entry-tool` пинить не нужно: это бинарник внутри
+  `limine-mkinitcpio-hook`.
+- `IgnorePkg` не мешает явной установке (`pacman -S ghostty` работает).
+
+## Грабли (кратко)
+
+1. `Architecture = auto` в pacman от CachyOS схлопывается в `x86_64` и не
+   ставит v4-пакеты → нужен явный список архитектур.
+2. Omarchy блокирует прямой `pacman -Syu` → `omarchy update`, либо
+   `OMARCHY_ALLOW_DIRECT_PACMAN=1` для теста.
+3. `omarchy-hyprland-titlebars` требует `hyprland=0.56.2`: либо пин стека,
+   либо удаление плагина и обновление до 0.57.2. `libjxl` держать вместе со
+   стеком (hyprgraphics 0.5.1 требует `libjxl.so=0.12`).
+4. Доступ в VM: ufw режет 22, диск под LUKS, hostfwd живёт до перезапуска
+   QEMU (после ребута гостя сохраняется, после рестарта домена — добавлять
+   заново).
+
+## Снапшоты (snapper, конфиг root)
+
+```
+1  4.5.0-3                      чистая установка
+2  before-cachyos-test          перед добавлением репозиториев
+3  cachyos-repos-upgraded       после массового апгрейда
+4  phase1-working               фаза 1
+5  phase2-all-cachyos-working   фаза 2 (весь стек из CachyOS)
+8  phase4-stock-hyprland        текущее состояние (фаза 4)
+```
+
+Откат: `sudo snapper --ambit classic -c root rollback <N>` и перезагрузка.
+Важно: cmdline жёстко использует `rootflags=subvol=@`, поэтому обычный
+`snapper rollback` без `--ambit classic` не сработает, а после отката
+требуется ручная подмена субтома (иначе загрузится старый `@`).
+
+## Скрипт `omarchy-cachyos.sh`
+
+Готовый сценарий перехода, собранный по этому тесту. Лежит рядом с отчётом.
+
+```
+./omarchy-cachyos.sh check          # диагностика и план, ничего не меняет
+./omarchy-cachyos.sh apply          # переход (снапшот, пины, репозитории, апгрейд, ядро)
+./omarchy-cachyos.sh apply --arch v4        # если CPU не Zen 4/5
+./omarchy-cachyos.sh apply --yes --no-mirrors
+./omarchy-cachyos.sh verify         # до и после перезагрузки
+./omarchy-cachyos.sh revert         # убрать репозитории и вернуть linux-omarchy
+```
+
+Что закрывает из найденных граблей:
+
+1. `Architecture = auto` от официального установщика → скрипт ставит явный
+   список `x86_64 x86_64_v3 x86_64_v4` (для v3 — без v4). Важно: установщик
+   в конце сам делает `pacman -Syu`, поэтому список прописывается **до**
+   него, причём в форме с двойным пробелом — её awk установщика не узнаёт
+   и не заменяет на `auto`. Иначе первый массовый апгрейд идёт базовым
+   x86_64, и пакеты, у которых версия в znver4-репозитории не выше
+   установленной (например, `lib32-mesa`), там и остаются.
+   Установщику нужен `gcc` для определения znver4 — если его нет, скрипт
+   сначала ставит `gcc`.
+2. Порядок репозиториев: по умолчанию `[omarchy]` остаётся первой (как
+   задумано в Omarchy), установщик CachyOS вставляет свои блоки выше —
+   скрипт их переносит. `--priority cachyos` делает наоборот.
+3. Миграция Omarchy `1791403252` ставит `[omarchy]` сразу после `[options]`
+   и запускает свой `pacman -Syu`. Запускается она один раз на пользователя
+   (маркер в `~/.local/state/omarchy/migrations/`), но при отсутствии маркера
+   (новый пользователь, перенесённый home) сработает — после обновления
+   скрипт перепроверяет порядок и при `--priority cachyos` возвращает его.
+   Порядок репозиториев влияет только на пакеты с **равными** версиями;
+   `[omarchy]` содержит ~30 своих пакетов, а не базу, а пересекающиеся
+   сборки (quickshell, limine-хуки, ghostty, walker) закреплены пинами.
+4. Пины `IgnorePkg` ставятся **до** первого апгрейда, иначе
+   `omarchy-hyprland-titlebars` ломается о hyprland 0.57, а quickshell,
+   limine-хуки, walker/ghostty подменяются сборками CachyOS.
+5. `libjxl` пиннится только если установленный `hyprgraphics` реально
+   зависит от `libjxl.so`.
+6. Ядро делается дефолтным через `omarchy kernel set`, а не правкой
+   `limine.conf`.
+7. Снапшот snapper + бэкап `pacman.conf`/mirrorlist/списка пакетов в
+   `/var/backups/omarchy-cachyos/`; `revert` возвращает эталон.
+8. `/boot` в Omarchy закрыт (700/600) — проверки загрузочной записи и UKI
+   идут через `sudo -n`, а без sudo честно печатают команды для ручной
+   проверки.
+9. `cachyos-rate-mirrors` не понимает `--help` и сразу переранжирует —
+   скрипт вызывает его только на шаге зеркал (или не вызывает вовсе с
+   `--no-mirrors`).
+10. Установщик CachyOS в конце делает `pacman -Syu`; alpm-хук Omarchy
+    (`00-omarchy-update-guard`) ругается на прямые апгрейды, но здесь
+    родитель — скрипт, так что хук не срабатывает. Скрипт всё равно
+    выставляет `OMARCHY_ALLOW_DIRECT_PACMAN=1` и сразу следом запускает
+    штатный `omarchy update` со снапшотом и миграциями.
+
+Ограничение: если CachyOS-репозитории уже были добавлены раньше с
+`Architecture = auto` и система успела обновиться базовыми x86_64-сборками,
+`apply` переставит архитектуру и обновит то, что новее, но пакеты с равной
+или более новой базовой версией (например, `firefox-pure`) останутся
+базовыми — это не потеря, просто без ISA-оптимизации. Для чистого
+znver4-набора нужен переход с чистой Omarchy.
+
+Проверено в VM: `check`, `verify`, `apply --dry-run`, `revert --dry-run`,
+нормализация на чистом `pacman-stable.conf` (приоритеты omarchy/cachyos,
+v3, повторный прогон — идемпотентно), `preset_arch_for_installer` вместе с
+awk установщика (znver4 и v3 — строка архитектур выживает), реальный
+`do_backup` + `apply_pins` на копии конфига. Полный `apply` не
+перезапускался: VM уже в состоянии «фаза 4», те же шаги выполнены вручную
+и описаны выше.
+
+## Полный прогон скрипта на чистой системе (v2.6 → v2.8)
+
+Переустановленная VM, запуск от обычного пользователя, без вмешательства.
+`apply` дошёл до конца, `verify` после перезагрузки — exit 0.
+
+- загрузка: 750 пакетов, ~1.7 ГБ, `omarchy update` поверх отранжированных
+  зеркал;
+- первая попытка упала не на скрипте, а на зеркале: `mirror5.krfoss.org`
+  (первое место у `cachyos-rate-mirrors`) отдал 4 файла со скоростью
+  «меньше 1 байта в секунду», pacman объявил хост битым и отказался
+  коммитить транзакцию (`failed to commit transaction`). Причина: рейтинг
+  меряет мелкие `.db`, которые у зеркала уже в кэше, а не пакеты;
+- повторный прогон с той же точки прошёл целиком: репозитории и 1.7 ГБ
+  кэша на месте, докачка дешёвая;
+- после перезагрузки: `7.3.6-1-cachyos`, 911 пакетов (707 из CachyOS,
+  128 `extra`, 37 `core`, 41 `[omarchy]`), 10 обновлений — все пины
+  `[ignored]`, `configerrors` пуст, упавших юнитов нет, quickshell живой,
+  `kernel-id=linux-cachyos` в limine, UKI на месте.
+
+Что из этого выросло в скрипте:
+
+- **2.4** — фоновый индикатор прогресса наследовал ERR-ловушку (`set -E`)
+  и каждые 30 секунд печатал ложную «ошибку на строке N» из `du` на
+  каталогах, которые pacman создаёт с правами 700;
+- **2.5** — `sudo -v` спрашивает пароль даже при `NOPASSWD` и без tty
+  падает («a terminal is required»): теперь сначала `sudo -n true`;
+- **2.6** — карантин зеркал: топ-3 проверяются настоящим пакетом, а если
+  pacman всё равно споткнётся, виновные хосты комментируются в mirrorlist
+  и `omarchy update` повторяется (до 3 раз, кэш сохраняется);
+- **2.7** — проба брала URL зависимости из Arch (`pacman -Sp` печатает
+  сперва зависимости) и получала 404 на всех зеркалах: теперь берётся
+  первый URL из `/cachyos/repo/`;
+- **2.8** — `read` из process substitution без завершающего `\n`
+  возвращал 1 и через `set -e` убивал apply: добавлен `\n`, `read`
+  необязателен, проба вызывается через `||`.
+
+Проверено отдельно на копиях mirrorlist в VM: медленное зеркало
+(92 КиБ/с на пакете) уходит в карантин, быстрое (194 КиБ/с) остаётся,
+пустой после карантина список восстанавливается, повторный разбор того же
+лога ничего не дублирует.
+
+## Аудит и исправления v2.9
+
+Полный аудит скрипта (1365 строк) и повторный чистый прогон `apply` →
+`verify` (exit 0) на этой же VM. Версия 2.9, все правки перенесены в
+канонический репозиторий.
+
+Ключевые находки и что сделано:
+
+- `ARCH/KERNEL/PRIORITY` из аргументов могли быть пустыми — теперь
+  проверка `[[ $# -ge 2 ]]`.
+- `exec > >(tee …)` оставлял открытый конец pipe: на выходе `wait tee`
+  висел. Stdout сохранён в fd 3 и закрывается в `on_exit`.
+- `db.lck` блокировал и read-only `check/verify` — теперь только `apply`.
+- Индикатор прогресса стирал строку `\r`, но не очищал её (`\033[2K`).
+- `cachyos-rate-mirrors` переранжировал только `cachyos-mirrorlist`;
+  порядок перенесён на v4/v3-списки с заменой `$arch` → `$arch_v4`,
+  `$arch_v3` (без `$arch_v4_v4`).
+- Карантин трогал все mirrorlist'ы, но мог закончить с пустым списком и
+  раскомментировать чужие `#Server`: последнее активное зеркало теперь
+  защищено.
+- Проба настоящим пакетом искала `/cachyos/repo/` и брала URL зависимостей
+  из Arch; теперь ищет `x86_64_v4/v3` и `repo/<arch>/`, порог
+  относительный (`s*2 < best`), если все медленные — карантин не
+  применяется. Изолированные тесты в harness и прямо на VM подтверждают.
+- `pacman -Sy`, установка `cachyos-rate-mirrors` и ранжирование больше не
+  гасятся; `omarchy update` идёт с `LC_ALL=C`, `timeout --foreground`
+  (по умолчанию 7200 c, `OMARCHY_CACHYOS_UPDATE_TIMEOUT`) и watchdog на
+  `[sudo]` в логе.
+- `setup_global_sudo_timestamp()` ставит временный dropin
+  `Defaults timestamp_type=global` **после** `sudo -v`, иначе таймстамп
+  остаётся tty-привязанным и `omarchy update` в своём pty спрашивает
+  пароль второй раз. Dropin удаляется на выходе; проверено в VM, включая
+  вложенный `script -qefc sudo`.
+- `OMARCHY_PATH` выставляется из `env-bootstrap`: без него `omarchy update`
+  падал с «OMARCHY_PATH does not match this Omarchy command» даже из tty.
+- Перед `apply` проверяется ≥10 ГБ на /var: `omarchy update` сам отказывается
+  работать при меньшем объёме (в тесте 9.2 ГБ хватило после очистки кэша
+  pacman — 12 ГБ).
+- `do_kernel()` доустанавливает недостающие headers/nvidia, если ядро уже стоит;
+  `repo_counts()` считает каждый пакет один раз по первому репозиторию;
+  `ld_supports()` вызывает `LC_ALL=C "$ld" --help`.
+- `verify` больше не глушит ошибки: `verify_fail()` ведёт `VERIFY_RC`,
+  добавлены ответ `hyprctl version` и устойчивый подсчёт
+  `systemctl --failed`; `apply` при провале `verify` не делает `--reboot`.
+- `revert` читает `kernel`/`snapshot` из последнего `meta.env`, восстанавливает
+  mirrorlist'ы, отключает таймер и удаляет реально установленные модули ядра.
+- `check` предупреждение про снапшот и план `apply` приведены к факту.
+
+Проверено: `bash -n`, изолированный harness для router/quarantine/demote/probe,
+`check`, `verify`, `--dry-run`, `revert --dry-run`, sudo-тест в VM; полный
+`apply --yes` с паролем, введённым один раз, завершился exit 0, `verify`
+после него — exit 0.
