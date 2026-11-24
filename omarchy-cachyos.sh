@@ -73,7 +73,7 @@ if [[ -r /usr/share/omarchy/default/bash/env-bootstrap ]]; then
 fi
 export OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
 
-VERSION="2.9"
+VERSION="2.10"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -170,18 +170,45 @@ as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
 # sudo -v в исходном терминале. На время apply кэш делается глобальным —
 # пароль вводится один раз, привилегии не расширяются. Файл удаляется
 # в on_exit даже при ошибке.
-# вызывается ПОСЛЕ sudo -v: пароль уже введён, поэтому dropin ставится
-# без пароля (sudo -n) и второго запроса не будет.
-setup_global_sudo_timestamp() {
+#
+# Важно: просто записать dropin после `sudo -v` недостаточно. sudo сразу
+# начинает искать ГЛОБАЛЬНУЮ запись, которой ещё нет, и следующий `sudo -n`
+# падает (видно в логе чистой установки). Поэтому пароль читаем сами один
+# раз, первым `sudo -S -v` создаём обычную запись, ставим dropin, а вторым
+# `sudo -S -v` (уже с global) создаём глобальную запись — без второго запроса
+# пользователю. Пароль живёт только в этой переменной и сразу затирается.
+ask_sudo_once() {
   (( EUID == 0 )) && return 0
-  local f="/etc/sudoers.d/omarchy-cachyos-$$"
-  if ! sudo -n sh -c 'umask 022; printf "Defaults timestamp_type=global\n" > "$1"' _ "$f" 2>/dev/null; then
+  sudo -n true 2>/dev/null && return 0
+  [[ -t 0 ]] || die "нужен tty или NOPASSWD: sudo не может запросить пароль (используйте ssh -t)"
+
+  local pw try
+  for try in 1 2 3; do
+    IFS= read -rs -p "[sudo] пароль для ${USER:-$(id -un)}: " pw || die "не удалось прочитать пароль sudo"
+    printf '\n' >&2
+    if printf '%s\n' "$pw" | sudo -S -v >/dev/null 2>&1; then
+      break
+    fi
+    unset pw
+    (( try == 3 )) && die "неверный пароль sudo"
+    warn "неверный пароль sudo, попробуйте ещё раз"
+  done
+
+  if ! sudo -n sh -c 'umask 022; printf "Defaults timestamp_type=global\n" > "$1"' _ \
+         "/etc/sudoers.d/omarchy-cachyos-$$" 2>/dev/null; then
     warn "не удалось сделать кэш sudo глобальным — omarchy update может спросить пароль ещё раз"
+    unset pw
     return 0
   fi
-  SUDO_DROPIN=$f
-  sudo -n true >/dev/null 2>&1 ||
-    warn "глобальный кэш sudo не подтверждён — повторный запрос пароля возможен"
+  SUDO_DROPIN="/etc/sudoers.d/omarchy-cachyos-$$"
+  # Теперь sudo читает global: создаём глобальную запись тем же паролем.
+  if printf '%s\n' "$pw" | sudo -S -v >/dev/null 2>&1; then
+    sudo -n true >/dev/null 2>&1 ||
+      warn "глобальный кэш sudo не подтверждён — повторный запрос пароля возможен"
+  else
+    warn "не удалось подтвердить глобальный кэш sudo — повторный запрос пароля возможен"
+  fi
+  unset pw
 }
 
 cleanup_sudo_dropin() {
@@ -500,8 +527,10 @@ preflight() {
   avail=$(df -Pk /var 2>/dev/null | awk 'NR==2{print int($4/1048576)}')
   # omarchy update сам отказывается работать при свободном месте <10 GiB —
   # лучше сказать об этом до снапшота и бэкапов, а не после 1.7 ГБ загрузки.
-  if [[ ${avail:-0} -lt 10 ]]; then
-    if [[ $CMD == apply && ! DRY ]]; then
+  # check/verify/status/revert ничего не обновляют: предупреждение о 10 GiB
+  # имеет смысл только перед apply, иначе оно срабатывает уже после апгрейда.
+  if [[ $CMD == apply && ${avail:-0} -lt 10 ]]; then
+    if (( ! DRY )); then
       die "на /var свободно ${avail:-?} ГБ, а omarchy update требует минимум 10 GiB — освободите место"
     fi
     warn "на /var свободно ${avail:-?} ГБ; omarchy update потребует ≥10 GiB"
@@ -1064,6 +1093,12 @@ do_update() {
       die "omarchy update прерван таймаутом/ожиданием ввода (код $rc) — см. $LOG"
     fi
     if (( rc == 0 )); then
+      # Даже при успешном апгрейде pacman мог сдаться на «404»/устаревшем
+      # зеркале и докачать пакеты с другого хоста. Убираем такой хост из
+      # mirrorlist сейчас, чтобы следующий прогон не начинал с него.
+      if demote_bad_mirrors "$log"; then
+        warn "в логе обновления были сбойные зеркала — они убраны из mirrorlist"
+      fi
       rm -f "$log"
       return 0
     fi
@@ -1441,16 +1476,9 @@ cmd_apply() {
     have curl || die "нужен curl для загрузки установщика CachyOS"
     curl -fsI --max-time 15 "$CACHYOS_REPO_URL" >/dev/null 2>&1 ||
       die "нет доступа к $CACHYOS_REPO_URL — проверьте интернет"
-    # sudo -v спрашивает пароль даже при NOPASSWD и без tty падает
-    # («a terminal is required»). Сначала проверяем, что sudo работает
-    # без пароля; только иначе просим его один раз.
-    if ! sudo -n true 2>/dev/null; then
-      # Пароль вводится один раз здесь. Затем (уже по кэшу) ставим dropin с
-      # timestamp_type=global: omarchy update запускает sudo в своём pty и
-      # без этого спросил бы пароль второй раз.
-      sudo -v || die "без sudo переход невозможен (нужен tty или NOPASSWD)"
-      setup_global_sudo_timestamp
-    fi
+    # Один запрос пароля (если NOPASSWD не настроен) + глобальный timestamp
+    # для omarchy update. Без tty сразу понятная ошибка.
+    ask_sudo_once
     start_sudo_keepalive
   fi
 
