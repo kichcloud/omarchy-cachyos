@@ -13,7 +13,8 @@
 #    4. ставит официальные репозитории CachyOS;
 #    5. прописывает явный Architecture и приоритет репозиториев;
 #    6. ранжирует зеркала через cachyos-rate-mirrors;
-#    7. обновляет систему штатным `omarchy update` (снапшот + миграции);
+#    7. обновляет систему штатным `omarchy update` (снапшот + миграции),
+#       заводя в карантин зеркала, которые залипли на загрузке пакетов;
 #    8. ставит linux-cachyos и делает его ядром по умолчанию;
 #    9. проверяет зависимости, пины, shell и загрузочную запись.
 #
@@ -43,6 +44,11 @@
 #      восстанавливается. Набор пакетов [omarchy] узкий, так что
 #      «омрачные поверх качиосовских» это не приводит: см. пины.
 #    * znver4-бинарники не переносимы на Intel/Skylake-X: только для Zen 4/5.
+#    * cachyos-rate-mirrors ранжирует по .db, а она мелкая и часто уже в кэше
+#      зеркала. Хост может мгновенно отдать базу и «встать» на 1.7 ГБ пакетов.
+#      Поэтому после ранжирования топ-3 проверяются настоящим пакетом, а если
+#      pacman всё равно споткнётся — виновное зеркало уходит в карантин
+#      (commented Server) и `omarchy update` повторяется: докачка из кэша дешёвая.
 #
 #  Запуск (от обычного пользователя, не от root):
 #      ./omarchy-cachyos.sh            # сразу apply: всё до конца, без вопросов
@@ -59,7 +65,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.5"
+VERSION="2.6"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -776,6 +782,91 @@ do_mirrors() {
   as_root systemctl enable --now cachyos-rate-mirrors.timer 2>/dev/null || true
   msg "зеркала отранжированы, таймер включён"
   grep -m3 '^Server' /etc/pacman.d/cachyos-mirrorlist 2>/dev/null | sed 's/^/    /' || true
+  probe_slow_mirrors
+}
+
+# --- карантин медленных зеркал ---------------------------------------------
+# Зеркало, которое «залипает» на пакетах, валит всю транзакцию: pacman ждёт
+# 10 секунд без байтов, объявляет хост битым и в итоге отказывается коммитить
+# («failed to commit transaction»), хотя часть пакетов уже скачана. Поэтому
+# проблемный хост комментируем в mirrorlist и повторяем — докачка дешёвая.
+MIRRORLISTS=(/etc/pacman.d/mirrorlist /etc/pacman.d/cachyos-mirrorlist)
+
+quarantine_host() {
+  local host=$1 esc f hit=1
+  esc=${host//./\\.}
+  for f in "${MIRRORLISTS[@]}"; do
+    [[ -f $f ]] || continue
+    as_root grep -qE "^Server = https?://${esc}/" "$f" || continue
+    as_root sed -i -E "s|^Server = (https?://${esc}/)|\#Server = \1|" "$f"
+    info "карантин: $host"
+    hit=0
+  done
+  # если карантин опустошил список, вернуть его целиком: остаться вообще без
+  # зеркал хуже, чем пользоваться медленным
+  for f in "${MIRRORLISTS[@]}"; do
+    [[ -f $f ]] || continue
+    if ! grep -qE '^Server = ' "$f"; then
+      as_root sed -i -E 's|^#Server = |Server = |' "$f"
+      warn "в $f не осталось зеркал — возвращаю список как был"
+    fi
+  done
+  return $hit
+}
+
+demote_bad_mirrors() {
+  local log=$1 hosts host hit=1
+  hosts=$(grep -aoE '(failed retrieving file .* from|too many errors from) [A-Za-z0-9._-]+' "$log" 2>/dev/null |
+            grep -aoE '[A-Za-z0-9._-]+$' | sort -u || true)
+  [[ -n $hosts ]] || return 1
+  while read -r host; do
+    [[ -n $host ]] || continue
+    if quarantine_host "$host"; then
+      hit=0
+    fi
+  done <<<"$hosts"
+  return $hit
+}
+
+# cachyos-rate-mirrors меряет скорость по .db, а база маленькая и часто уже в
+# кэше зеркала: хост может отдавать её мгновенно и «стоять» на пакетах.
+# Проверяем первые три зеркала настоящим пакетом (первые 256 КиБ).
+probe_slow_mirrors() {
+  local pkg url rel repo arch file srv u code speed host
+  local -a servers=()
+  pkg=$(LC_ALL=C pacman -Sl cachyos-extra-znver4 2>/dev/null | awk 'NR==1{print $2}')
+  [[ -n ${pkg:-} ]] || pkg=$(LC_ALL=C pacman -Sl cachyos 2>/dev/null | awk 'NR==1{print $2}')
+  [[ -n ${pkg:-} ]] || return 0
+  url=$(LC_ALL=C pacman -Sp --print-format '%l' "$pkg" 2>/dev/null | head -1)
+  [[ -n $url ]] || return 0
+  rel=${url#*://}; rel=${rel#*/}
+  file=${rel##*/}
+  repo=${rel%/*}; repo=${repo##*/}
+  arch=$(awk -F/ '{for (i = 2; i < NF; i++) if ($i == "repo") { print $(i + 1); exit }}' <<<"$rel")
+  [[ -n $arch ]] || return 0
+
+  while IFS= read -r srv; do servers+=("$srv"); done < <(grep -m3 -E '^Server = ' /etc/pacman.d/cachyos-mirrorlist 2>/dev/null)
+  (( ${#servers[@]} )) || return 0
+
+  info "проверяю скорость зеркал на настоящем пакете ($file)..."
+  for srv in "${servers[@]}"; do
+    srv=${srv#Server = }
+    u=${srv//\$arch/$arch}; u=${u//\$repo/$repo}
+    u=${u%/}/$file
+    read -r code speed < <(curl -o /dev/null -sS --max-time 8 -r 0-262143 \
+      -w '%{http_code} %{speed_download}' "$u" 2>/dev/null || echo '000 0')
+    case ${code:-000} in
+      2*) ;;
+      *) continue ;;   # 404 — зеркало ещё не синхронизировалось, это не «медленно»
+    esac
+    host=${srv#*://}; host=${host%%/*}
+    if awk -v s="${speed:-0}" 'BEGIN { exit !(s < 100000) }'; then
+      warn "медленно на пакете: $host ($(awk -v s="${speed:-0}" 'BEGIN{printf "%.0f", s/1024}') КиБ/с)"
+      quarantine_host "$host" || true
+    else
+      info "быстро: $host ($(awk -v s="${speed:-0}" 'BEGIN{printf "%.0f", s/1024}') КиБ/с)"
+    fi
+  done
 }
 
 do_update() {
@@ -783,10 +874,35 @@ do_update() {
     info "[dry-run] omarchy update -y"
     return
   fi
-  msg "обновляю систему штатным omarchy update (снапшот + миграции)"
-  start_progress
-  omarchy update -y || { stop_progress; die "omarchy update завершился с ошибкой — см. вывод выше; скрипт можно запустить повторно"; }
-  stop_progress
+  local attempt rc log
+  log=$(mktemp "${TMPDIR:-/tmp}/omarchy-update.XXXXXX.log")
+  for attempt in 1 2 3; do
+    if (( attempt == 1 )); then
+      msg "обновляю систему штатным omarchy update (снапшот + миграции)"
+    else
+      msg "omarchy update, повтор $attempt из 3 (уже скачанное остаётся в кэше)"
+    fi
+    start_progress
+    rc=0
+    # Вывод идёт и в терминал, и в лог: по нему видно, на каком зеркале
+    # pacman споткнулся, чтобы увести именно его в карантин.
+    omarchy update -y 2>&1 | tee "$log" || rc=$?
+    stop_progress
+    if (( rc == 0 )); then
+      rm -f "$log"
+      return 0
+    fi
+    (( attempt < 3 )) || break
+    if demote_bad_mirrors "$log"; then
+      warn "зеркало(а) в карантине — обновляю базы и повторяю"
+      as_root pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    else
+      warn "в выводе нет проблемных зеркал — повтор ничего не даст"
+      break
+    fi
+  done
+  rm -f "$log"
+  die "omarchy update завершился с ошибкой — см. вывод выше; скрипт можно запустить повторно"
 }
 
 check_pins_after_update() {
