@@ -59,7 +59,7 @@
 # =============================================================================
 set -Eeuo pipefail
 
-VERSION="2.2"
+VERSION="2.3"
 
 CMD=apply
 KERNEL=linux-cachyos
@@ -134,6 +134,9 @@ boot_grep() {
 }
 boot_file() {
   [[ -e $1 ]] || sudo -n test -e "$1" 2>/dev/null
+}
+boot_dir() {
+  [[ -d $1 ]] || sudo -n test -d "$1" 2>/dev/null
 }
 can_check_boot() {
   [[ -r /boot/limine.conf ]] || sudo -n true 2>/dev/null
@@ -843,7 +846,9 @@ do_kernel() {
   [[ -f /boot/limine.conf ]] &&
     { as_root grep -q "kernel-id=$KERNEL" /boot/limine.conf ||
       warn "в /boot/limine.conf нет записи kernel-id=$KERNEL"; }
-  if ! as_root test -f "/boot/EFI/Linux/omarchy_${KERNEL}.efi"; then
+  # Omarchy грузит ядро либо через limine-entry-tool (path/module_path в /boot),
+  # либо через UKI в /boot/EFI/Linux — проверяем UKI, только если он вообще есть.
+  if boot_dir /boot/EFI/Linux && ! boot_file "/boot/EFI/Linux/omarchy_${KERNEL}.efi"; then
     warn "нет UKI /boot/EFI/Linux/omarchy_${KERNEL}.efi"
   fi
 }
@@ -930,7 +935,8 @@ cmd_verify() {
   sect "Обновления"
   local tmpu
   tmpu=$(mktemp)
-  pacman -Qu 2>/dev/null >"$tmpu" || true
+  # LC_ALL=C: иначе маркер [ignored] локализуется и проверка пинов ложно срабатывает.
+  LC_ALL=C pacman -Qu 2>/dev/null >"$tmpu" || true
   if (( ${#pins[@]} )); then
     printf '%s\n' "${pins[@]}" >"$STATE_DIR/pins-verify.txt"
     local bad
@@ -957,9 +963,11 @@ cmd_verify() {
   else
     warn "в limine.conf нет записи kernel-id=$KERNEL"
   fi
-  if can_check_boot; then
+  if can_check_boot && boot_dir /boot/EFI/Linux; then
     boot_file "/boot/EFI/Linux/omarchy_${KERNEL}.efi" &&
       msg "UKI на месте" || warn "нет /boot/EFI/Linux/omarchy_${KERNEL}.efi"
+  elif can_check_boot; then
+    info "загрузка через limine-entry-tool, без UKI — для этой установки это норма"
   fi
 
   sect "Сессия"
@@ -1158,7 +1166,7 @@ cmd_status() {
   echo "омарчи:      $(pkg_ver omarchy || echo '?')"
   echo "репозитории: $(pconf --repo-list | tr '\n' ' ')"
   echo "архитектура: $(pconf Architecture | tr '\n' ' ')"
-  echo "обновлений:  $(pacman -Qu 2>/dev/null | wc -l) (из них игнорируется: $(pacman -Qu 2>/dev/null | grep -c '\[ignored\]' || true))"
+  echo "обновлений:  $(LC_ALL=C pacman -Qu 2>/dev/null | wc -l) (из них игнорируется: $(LC_ALL=C pacman -Qu 2>/dev/null | grep -c '\[ignored\]' || true))"
   echo "пины:        $(ignore_list_from_conf "$PACMAN_CONF" | tr '\n' ' ')"
   echo "shell:       $(pgrep -x quickshell >/dev/null && echo 'работает' || echo 'не запущен')"
 }
